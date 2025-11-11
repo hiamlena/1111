@@ -7,6 +7,7 @@ import { YandexRouter } from './router.js';
 let map, multiRoute, viaPoints = [];
 let viaMarkers = [];
 let activeRouteChangeHandler = null;
+let framesToggleStateBeforeCar = null;
 
 /* ---------- Хелперы для работы с geoObjects ---------- */
 function addToMap(obj) {
@@ -23,6 +24,74 @@ function removeFromMap(obj) {
 }
 function isOnMap(obj) {
   return !!(obj && obj.__tt_onMap === true);
+}
+
+function normalizeCoordPair(pair) {
+  if (!Array.isArray(pair) || pair.length < 2) return null;
+  let [x, y] = pair;
+  const absX = Math.abs(Number(x));
+  const absY = Math.abs(Number(y));
+  if (!Number.isFinite(absX) || !Number.isFinite(absY)) return null;
+  // Если первая координата выглядит как широта — меняем порядок
+  if (absX <= 90 && absY > 90) {
+    [x, y] = [y, x];
+  }
+  return [Number(x), Number(y)];
+}
+
+function normalizeBBox(rawBBox) {
+  if (!Array.isArray(rawBBox) || rawBBox.length < 2) return null;
+  const p1 = normalizeCoordPair(rawBBox[0]);
+  const p2 = normalizeCoordPair(rawBBox[1]);
+  if (!p1 || !p2) return null;
+  const [lon1, lat1] = p1;
+  const [lon2, lat2] = p2;
+  return [
+    [Math.min(lon1, lon2), Math.min(lat1, lat2)],
+    [Math.max(lon1, lon2), Math.max(lat1, lat2)]
+  ];
+}
+
+function expandBBox(bbox, margin = 0) {
+  const norm = normalizeBBox(bbox);
+  if (!norm) return null;
+  const [[minLon, minLat], [maxLon, maxLat]] = norm;
+  return [
+    [minLon - margin, minLat - margin],
+    [maxLon + margin, maxLat + margin]
+  ];
+}
+
+function bboxFromPoints(points, margin = 0.05) {
+  if (!Array.isArray(points) || points.length === 0) return null;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  points.forEach(pt => {
+    const norm = normalizeCoordPair(pt);
+    if (!norm) return;
+    const [lon, lat] = norm;
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lon < minLon) minLon = lon;
+    if (lon > maxLon) maxLon = lon;
+  });
+  if (!Number.isFinite(minLat) || !Number.isFinite(minLon) || !Number.isFinite(maxLat) || !Number.isFinite(maxLon)) {
+    return null;
+  }
+  return [
+    [minLon - margin, minLat - margin],
+    [maxLon + margin, maxLat + margin]
+  ];
+}
+
+function getCurrentVehMode() {
+  return document.querySelector('input[name=veh]:checked')?.value || 'truck40';
+}
+
+function isCarMode() {
+  return getCurrentVehMode() === 'car';
 }
 
 const LAYERS_BASE = window.TRANSTIME_CONFIG?.layersBase || (location.pathname.replace(/\/[^/]*$/, '') + '/data');
@@ -207,50 +276,113 @@ function openInNavigator() {
 }
 
 /** Фильтрация весовых рамок по bbox активного маршрута */
-function updateFramesForRoute(pts) {
+function applyFramesBBox(bbox) {
   if (!layers.frames?.objects) return;
-  if (!Array.isArray(pts) || pts.length === 0) {
-    layers.frames.objects.setFilter(null);
+  if (!bbox) {
+    layers.frames.objects.setFilter?.(null);
     return;
   }
-  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-  pts.forEach(([lon, lat]) => {
-    if (lat < minLat) minLat = lat;
-    if (lat > maxLat) maxLat = lat;
-    if (lon < minLon) minLon = lon;
-    if (lon > maxLon) maxLon = lon;
-  });
-  const m = 0.05;
-  minLat -= m; maxLat += m; minLon -= m; maxLon += m;
-
+  const expanded = expandBBox(bbox, 0.02);
+  if (!expanded) {
+    layers.frames.objects.setFilter?.(null);
+    return;
+  }
+  const [[minLon, minLat], [maxLon, maxLat]] = expanded;
   layers.frames.objects.setFilter(obj => {
-    const gc = obj.geometry?.coordinates;
-    if (!gc) return false;
-    const [lon, lat] = gc;
+    const coords = normalizeCoordPair(obj.geometry?.coordinates);
+    if (!coords) return false;
+    const [lon, lat] = coords;
     return lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon;
   });
 }
 
+function collectRouteGeometryPoints(route) {
+  const pts = [];
+  if (!route) return pts;
+  try {
+    route.getPaths?.().each(path => {
+      path.getSegments?.().each(segment => {
+        const coords = segment.getCoordinates?.();
+        if (Array.isArray(coords)) {
+          coords.forEach(c => { if (Array.isArray(c)) pts.push(c); });
+        }
+      });
+    });
+  } catch {}
+  return pts;
+}
+
 function refreshFramesForActiveRoute(fallbackPoints) {
+  if (isCarMode()) {
+    removeFromMap(layers.frames);
+    layers.frames?.objects?.setFilter?.(null);
+    return;
+  }
   const framesToggle = $('#toggle-frames');
   if (!framesToggle?.checked) return;
-  let pts = [];
-  try {
-    const wps = multiRoute?.getWayPoints?.();
-    if (wps?.each) {
-      wps.each(wp => {
-        const coords = wp.geometry?.getCoordinates?.();
-        if (Array.isArray(coords)) pts.push(coords);
-      });
+
+  let bbox = null;
+  const activeRoute = multiRoute?.getActiveRoute?.();
+  if (activeRoute) {
+    bbox = normalizeBBox(activeRoute.properties?.get?.('boundedBy'));
+    if (!bbox && activeRoute.model?.getBounds) bbox = normalizeBBox(activeRoute.model.getBounds());
+    if (!bbox && activeRoute.getBounds) bbox = normalizeBBox(activeRoute.getBounds());
+    if (!bbox) {
+      const geomPts = collectRouteGeometryPoints(activeRoute);
+      bbox = bboxFromPoints(geomPts);
     }
-  } catch {}
-  if (!pts.length && Array.isArray(fallbackPoints) && fallbackPoints.length) {
-    pts = fallbackPoints;
   }
-  if (!pts.length) {
-    pts = viaPoints.slice();
+
+  if (!bbox && Array.isArray(fallbackPoints) && fallbackPoints.length) {
+    bbox = bboxFromPoints(fallbackPoints);
   }
-  updateFramesForRoute(pts);
+
+  if (!bbox) {
+    const wpPts = [];
+    try {
+      const wps = multiRoute?.getWayPoints?.();
+      wps?.each(wp => {
+        const coords = wp.geometry?.getCoordinates?.();
+        if (Array.isArray(coords)) wpPts.push(coords);
+      });
+    } catch {}
+    if (!wpPts.length) {
+      wpPts.push(...viaPoints);
+    }
+    bbox = bboxFromPoints(wpPts);
+  }
+
+  applyFramesBBox(bbox);
+}
+
+function syncFramesLayerVisibility() {
+  const manager = layers.frames;
+  const framesToggle = $('#toggle-frames');
+  if (!framesToggle || !manager) return;
+  const car = isCarMode();
+  framesToggle.disabled = car;
+  if (car) {
+    if (framesToggleStateBeforeCar === null) {
+      framesToggleStateBeforeCar = framesToggle.checked;
+    }
+    framesToggle.checked = false;
+    removeFromMap(manager);
+    manager.objects?.setFilter?.(null);
+    return;
+  }
+
+  if (framesToggleStateBeforeCar !== null) {
+    framesToggle.checked = framesToggleStateBeforeCar;
+    framesToggleStateBeforeCar = null;
+  }
+
+  if (framesToggle.checked) {
+    addToMap(manager);
+    refreshFramesForActiveRoute();
+  } else {
+    removeFromMap(manager);
+    manager.objects?.setFilter?.(null);
+  }
 }
 
 /** Отрисовка списка альтернатив */
@@ -399,6 +531,7 @@ async function toggleLayer(name, on, checkbox) {
       checkbox && (checkbox.checked = false);
       manager.removeAll?.();
       removeFromMap(manager);
+      if (name === 'frames') syncFramesLayerVisibility();
       return;
     }
     ensureFeatureIds(fc, name);
@@ -407,10 +540,14 @@ async function toggleLayer(name, on, checkbox) {
     manager.removeAll?.();
     manager.add(fc);
     addToMap(manager);
-    if (name === 'frames') refreshFramesForActiveRoute();
+    if (name === 'frames') {
+      refreshFramesForActiveRoute();
+      syncFramesLayerVisibility();
+    }
   } else {
     removeFromMap(manager);
     if (name === 'frames' && manager.objects?.setFilter) manager.objects.setFilter(null);
+    if (name === 'frames') syncFramesLayerVisibility();
   }
 }
 
@@ -469,9 +606,13 @@ function setup() {
   function updateVehGroup() {
     vehRadios.forEach(r => r.parentElement.classList.toggle('active', r.checked));
   }
+  function handleVehicleChange() {
+    updateVehGroup();
+    syncFramesLayerVisibility();
+  }
 
   [from, to].forEach(inp => inp?.addEventListener('input', updateUI));
-  vehRadios.forEach(radio => radio.addEventListener('change', updateVehGroup));
+  vehRadios.forEach(radio => radio.addEventListener('change', handleVehicleChange));
 
   cFrames?.addEventListener('change', e => toggleLayer('frames', e.target.checked, cFrames));
   cHgvA?.addEventListener('change', e => toggleLayer('hgvAllowed', e.target.checked, cHgvA));
@@ -508,6 +649,7 @@ function setup() {
 
   updateUI();
   updateVehGroup();
+  syncFramesLayerVisibility();
 }
 
 /** Построение маршрута */
@@ -550,7 +692,7 @@ async function onBuild() {
     highlightActiveRouteItem();
     refreshFramesForActiveRoute(points);
 
-    // Хук для следующего шага: реагируем на смену активного маршрута (bbox-фильтр рамок будет добавлен отдельно)
+    // Отслеживаем смену активного маршрута: обновляем список и фильтр рамок
     if (multiRoute?.events?.add) {
       activeRouteChangeHandler = () => {
         highlightActiveRouteItem();

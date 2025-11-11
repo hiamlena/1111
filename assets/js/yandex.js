@@ -6,26 +6,46 @@ import { YandexRouter } from './router.js';
 
 let map, multiRoute, viaPoints = [];
 let viaMarkers = [];
+let activeRouteChangeHandler = null;
 
-/* ---------- Хелперы для работы с geoObjects (в v2.1 нет contains) ---------- */
-function isOnMap(obj) {
-  if (!map || !obj) return false;
-  try {
-    if (typeof map.geoObjects.indexOf === 'function') {
-      return map.geoObjects.indexOf(obj) !== -1;
-    }
-  } catch (e) {}
-  return !!obj?.__tt_onMap;
-}
+/* ---------- Хелперы для работы с geoObjects ---------- */
 function addToMap(obj) {
-  if (!obj || !map) return;
-  if (!isOnMap(obj)) map.geoObjects.add(obj);
-  obj.__tt_onMap = true;
+  if (obj && map && !isOnMap(obj)) {
+    map.geoObjects.add(obj);
+    obj.__tt_onMap = true;
+  }
 }
 function removeFromMap(obj) {
-  if (!obj || !map) return;
-  try { map.geoObjects.remove(obj); } catch (e) {}
-  obj.__tt_onMap = false;
+  if (obj && map && isOnMap(obj)) {
+    map.geoObjects.remove(obj);
+    obj.__tt_onMap = false;
+  }
+}
+function isOnMap(obj) {
+  return !!(obj && obj.__tt_onMap === true);
+}
+
+const LAYERS_BASE = window.TRANSTIME_CONFIG?.layersBase || (location.pathname.replace(/\/[^/]*$/, '') + '/data');
+function urlFromBase(name) {
+  return `${LAYERS_BASE}/${name}`;
+}
+
+async function loadGeoJSON(filename, friendlyName) {
+  const url = urlFromBase(filename);
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (res.status === 404) {
+      toast(`Нет данных слоя: ${friendlyName || filename}`);
+      return { type: 'FeatureCollection', features: [], __tt_httpStatus: 404 };
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data && typeof data === 'object') data.__tt_httpStatus = res.status;
+    return data;
+  } catch (e) {
+    toast(`Ошибка загрузки ${friendlyName || filename}: ${e.message}`);
+    return { type: 'FeatureCollection', features: [], __tt_httpStatus: -1 };
+  }
 }
 
 /** Список сохранённых маршрутов. Загружается из localStorage при инициализации */
@@ -211,6 +231,28 @@ function updateFramesForRoute(pts) {
   });
 }
 
+function refreshFramesForActiveRoute(fallbackPoints) {
+  const framesToggle = $('#toggle-frames');
+  if (!framesToggle?.checked) return;
+  let pts = [];
+  try {
+    const wps = multiRoute?.getWayPoints?.();
+    if (wps?.each) {
+      wps.each(wp => {
+        const coords = wp.geometry?.getCoordinates?.();
+        if (Array.isArray(coords)) pts.push(coords);
+      });
+    }
+  } catch {}
+  if (!pts.length && Array.isArray(fallbackPoints) && fallbackPoints.length) {
+    pts = fallbackPoints;
+  }
+  if (!pts.length) {
+    pts = viaPoints.slice();
+  }
+  updateFramesForRoute(pts);
+}
+
 /** Отрисовка списка альтернатив */
 function renderRouteList(routes) {
   const listEl = document.getElementById('routeList');
@@ -258,6 +300,67 @@ const layers = {
   federal: null
 };
 
+const layerConfigs = {
+  frames: {
+    filename: 'frames_ready.geojson',
+    friendlyName: 'Весовые рамки',
+    options: { preset: 'islands#blueCircleDotIcon', zIndex: 220 }
+  },
+  hgvAllowed: {
+    filename: 'hgv_allowed.geojson',
+    friendlyName: 'Разрешённый проезд ТС >3,5т',
+    options: { preset: 'islands#darkGreenCircleDotIcon', zIndex: 210 }
+  },
+  hgvConditional: {
+    filename: 'hgv_conditional.geojson',
+    friendlyName: 'Условно разрешённый проезд ТС >3,5т',
+    options: { preset: 'islands#yellowCircleDotIcon', zIndex: 205 }
+  },
+  federal: {
+    filename: 'federal.geojson',
+    friendlyName: 'Федеральные трассы',
+    options: { preset: 'islands#grayCircleDotIcon', zIndex: 200 }
+  }
+};
+
+function applyLayerOptions(manager, options = {}) {
+  if (!manager?.objects?.options) return;
+  Object.entries(options).forEach(([key, value]) => {
+    manager.objects.options.set(key, value);
+  });
+  manager.objects.options.set({
+    strokeColor: '#60a5fa',
+    strokeWidth: 3,
+    strokeOpacity: 0.9,
+    fillOpacity: 0.3
+  });
+}
+
+function decorateFeatureCollection(fc) {
+  if (!fc?.features) return;
+  fc.features.forEach(f => {
+    const p = f.properties || {};
+    f.properties = {
+      hintContent: p.name || p.title || 'Объект',
+      balloonContent:
+        `<b>${escapeHtml(p.name || p.title || 'Объект')}</b>` +
+        (p.comment ? `<div class="mt6">${escapeHtml(p.comment)}</div>` : '') +
+        (p.date ? `<div class="small mt6">Дата: ${escapeHtml(p.date)}</div>` : '')
+    };
+  });
+}
+
+// Гарантия уникальных feature.id для ObjectManager
+function ensureFeatureIds(fc, prefix = 'fc') {
+  if (!fc?.features) return;
+  let i = 0;
+  fc.features.forEach(f => {
+    if (f && (f.id === undefined || f.id === null)) {
+      f.id = `${prefix}_${i++}`;
+    }
+  });
+}
+
 /** Точка входа — загрузка SDK */
 export function init() {
   const cfg = (window.TRANSTIME_CONFIG && window.TRANSTIME_CONFIG.yandex) || null;
@@ -271,7 +374,7 @@ export function init() {
     'https://api-maps.yandex.ru/2.1/?apikey=' + encodeURIComponent(cfg.apiKey) +
     '&lang=' + encodeURIComponent(cfg.lang || 'ru_RU') +
     '&csp=true&coordorder=longlat' +
-    '&load=package.standard,package.search,multiRouter.MultiRoute,package.geoObjects';
+    '&load=package.standard,package.search,multiRouter.MultiRoute,package.geoObjects,ObjectManager';
 
   script.onload = () => (window.ymaps && typeof ymaps.ready === 'function')
     ? ymaps.ready(setup)
@@ -281,97 +384,33 @@ export function init() {
   document.head.appendChild(script);
 }
 
-/** Универсальный загрузчик GeoJSON в ObjectManager */
-async function loadGeoJsonLayer(url, options = {}) {
-  const r = await fetch(url + (url.includes('?') ? '&' : '?') + 'v=' + Date.now(), { cache: 'no-store' });
-  if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url);
-  const data = await r.json();
-
-  const om = new ymaps.ObjectManager({ clusterize: false });
-  if (options.preset) om.objects.options.set({ preset: options.preset });
-  if (options.zIndex) om.objects.options.set({ zIndex: options.zIndex });
-  om.objects.options.set({
-    strokeColor: options.strokeColor || '#60a5fa',
-    strokeWidth: options.strokeWidth || 3,
-    strokeOpacity: options.strokeOpacity || 0.9,
-    fillOpacity: options.fillOpacity ?? 0.3
-  });
-
-  if (data?.features?.length) {
-    data.features.forEach(f => {
-      const p = f.properties || {};
-      f.properties = {
-        hintContent: p.name || p.title || 'Объект',
-        balloonContent:
-          `<b>${escapeHtml(p.name || p.title || 'Объект')}</b>` +
-          (p.comment ? `<div class="mt6">${escapeHtml(p.comment)}</div>` : '') +
-          (p.date ? `<div class="small mt6">Дата: ${escapeHtml(p.date)}</div>` : '')
-      };
-    });
-  }
-
-  om.add(data);
-  return om;
-}
-
-/** Конкретные загрузчики слоёв */
-async function loadFrames() {
-  if (layers.frames) return layers.frames;
-  layers.frames = await loadGeoJsonLayer('../data/frames_ready.geojson', {
-    preset: 'islands#blueCircleDotIcon',
-    zIndex: 220
-  });
-  addToMap(layers.frames);
-  return layers.frames;
-}
-async function loadHgvAllowed() {
-  if (layers.hgvAllowed) return layers.hgvAllowed;
-  layers.hgvAllowed = await loadGeoJsonLayer('../data/hgv_allowed.geojson', {
-    preset: 'islands#darkGreenCircleDotIcon',
-    zIndex: 210
-  });
-  addToMap(layers.hgvAllowed);
-  return layers.hgvAllowed;
-}
-async function loadHgvConditional() {
-  if (layers.hgvConditional) return layers.hgvConditional;
-  layers.hgvConditional = await loadGeoJsonLayer('../data/hgv_conditional.geojson', {
-    preset: 'islands#yellowCircleDotIcon',
-    zIndex: 205
-  });
-  addToMap(layers.hgvConditional);
-  return layers.hgvConditional;
-}
-async function loadFederal() {
-  if (layers.federal) return layers.federal;
-  layers.federal = await loadGeoJsonLayer('../data/federal.geojson', {
-    preset: 'islands#grayCircleDotIcon',
-    zIndex: 200
-  });
-  addToMap(layers.federal);
-  return layers.federal;
-}
-
-/** Включение/выключение слоя по имени */
-async function toggleLayer(name, on) {
+async function toggleLayer(name, on, checkbox) {
   if (!map) return;
-  const registry = {
-    frames: loadFrames,
-    hgvAllowed: loadHgvAllowed,
-    hgvConditional: loadHgvConditional,
-    federal: loadFederal
-  };
-  const loader = registry[name];
-  if (!loader) return;
+  const cfg = layerConfigs[name];
+  const manager = layers[name];
+  if (!cfg || !manager) return;
 
   if (on) {
-    const layer = await loader();
-    addToMap(layer);
-    if (name === 'frames') updateFramesForRoute(viaPoints.length ? [[...viaPoints[0]]] : []);
+    const fc = await loadGeoJSON(cfg.filename, cfg.friendlyName);
+    if (!Array.isArray(fc.features) || fc.features.length === 0) {
+      if (fc.__tt_httpStatus !== 404) {
+        toast(`Нет данных слоя: ${cfg.friendlyName}`);
+      }
+      checkbox && (checkbox.checked = false);
+      manager.removeAll?.();
+      removeFromMap(manager);
+      return;
+    }
+    ensureFeatureIds(fc, name);
+    decorateFeatureCollection(fc);
+    delete fc.__tt_httpStatus;
+    manager.removeAll?.();
+    manager.add(fc);
+    addToMap(manager);
+    if (name === 'frames') refreshFramesForActiveRoute();
   } else {
-    const layer = layers[name];
-    if (layer) removeFromMap(layer);
-    if (name === 'frames' && layer?.objects?.setFilter) layer.objects.setFilter(null);
+    removeFromMap(manager);
+    if (name === 'frames' && manager.objects?.setFilter) manager.objects.setFilter(null);
   }
 }
 
@@ -384,6 +423,12 @@ function setup() {
   if (!document.getElementById('map')) return toast('Не найден контейнер #map', 2500);
 
   map = new ymaps.Map('map', { center, zoom, controls: ['zoomControl', 'typeSelector'] }, { suppressMapOpenBlock: true });
+
+  Object.entries(layerConfigs).forEach(([name, cfg]) => {
+    const manager = new ymaps.ObjectManager({ clusterize: false });
+    layers[name] = manager;
+    applyLayerOptions(manager, cfg.options);
+  });
 
   const from = $('#from');
   const to   = $('#to');
@@ -428,23 +473,15 @@ function setup() {
   [from, to].forEach(inp => inp?.addEventListener('input', updateUI));
   vehRadios.forEach(radio => radio.addEventListener('change', updateVehGroup));
 
-  cFrames?.addEventListener('change', e => {
-    const checked = e.target.checked;
-    toggleLayer('frames', checked);
-    if (checked && multiRoute?.getWayPoints) {
-      const arr = [];
-      multiRoute.getWayPoints().each(wp => arr.push(wp.geometry.getCoordinates()));
-      updateFramesForRoute(arr);
-    }
-  });
-  cHgvA?.addEventListener('change', e => toggleLayer('hgvAllowed', e.target.checked));
-  cHgvC?.addEventListener('change', e => toggleLayer('hgvConditional', e.target.checked));
-  cFed ?.addEventListener('change', e => toggleLayer('federal', e.target.checked));
+  cFrames?.addEventListener('change', e => toggleLayer('frames', e.target.checked, cFrames));
+  cHgvA?.addEventListener('change', e => toggleLayer('hgvAllowed', e.target.checked, cHgvA));
+  cHgvC?.addEventListener('change', e => toggleLayer('hgvConditional', e.target.checked, cHgvC));
+  cFed ?.addEventListener('change', e => toggleLayer('federal', e.target.checked, cFed));
 
-  if (cHgvA?.checked) toggleLayer('hgvAllowed', true);
-  if (cFrames?.checked) toggleLayer('frames', true);
-  if (cHgvC?.checked) toggleLayer('hgvConditional', true);
-  if (cFed ?.checked) toggleLayer('federal', true);
+  if (cHgvA?.checked) toggleLayer('hgvAllowed', true, cHgvA);
+  if (cFrames?.checked) toggleLayer('frames', true, cFrames);
+  if (cHgvC?.checked) toggleLayer('hgvConditional', true, cHgvC);
+  if (cFed ?.checked) toggleLayer('federal', true, cFed);
 
   map.events.add('click', (e) => {
     const coords = e.get('coords');
@@ -495,18 +532,34 @@ async function onBuild() {
     const mr = res.multiRoute;
     const routes = res.routes;
 
-    if (multiRoute) removeFromMap(multiRoute);
+    const prevMultiRoute = multiRoute;
+    if (prevMultiRoute) {
+      if (activeRouteChangeHandler && prevMultiRoute.events?.remove) {
+        try { prevMultiRoute.events.remove('activeroutechange', activeRouteChangeHandler); } catch {}
+      }
+      removeFromMap(prevMultiRoute);
+    }
     multiRoute = mr;
     addToMap(multiRoute);
 
+    if (activeRouteChangeHandler && multiRoute?.events?.remove) {
+      try { multiRoute.events.remove('activeroutechange', activeRouteChangeHandler); } catch {}
+    }
+
     renderRouteList(routes);
     highlightActiveRouteItem();
-    updateFramesForRoute(points);
+    refreshFramesForActiveRoute(points);
 
-    multiRoute.events.add('activeroutechange', () => {
-      highlightActiveRouteItem();
-      updateFramesForRoute(points);
-    });
+    // Хук для следующего шага: реагируем на смену активного маршрута (bbox-фильтр рамок будет добавлен отдельно)
+    if (multiRoute?.events?.add) {
+      activeRouteChangeHandler = () => {
+        highlightActiveRouteItem();
+        refreshFramesForActiveRoute(points);
+      };
+      multiRoute.events.add('activeroutechange', activeRouteChangeHandler);
+    } else {
+      activeRouteChangeHandler = null;
+    }
 
     toast('Маршрут успешно построен', 1800);
   } catch (e) {

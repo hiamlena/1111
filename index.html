@@ -6,6 +6,23 @@
     name="viewport"
     content="width=device-width, initial-scale=1, maximum-scale=1"
   />
+  <!-- Исправляет ошибку 404 для favicon.ico и добавляет расширенную поддержку наборов favicon -->
+  <link
+    id="tt-favicon"
+    rel="icon"
+    href="/favicon.ico"
+    type="image/x-icon"
+    sizes="32x32"
+  />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any" />
+  <link
+    rel="apple-touch-icon"
+    sizes="180x180"
+    href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAYAAAA9zQYyAAABaklEQVR42u3SMQ0AAAjAMEygCqeYBA+cpEcNLIusHvgiRMDQYGgwNBgaQ4OhwdBgaDA0hgZDg6HB0GBoDA2GBkODocHQGBoMDYYGQ4OhMTQYGgwNhgZDY2gwNBgaDA2GxtBgaDA0GBpDC4GhwdBgaDA0hgZDg6HB0GBoDA2GBkODocHQGBoMDYYGQ4OhMTQYGgwNhgZDY2gwNBgaDA2GxtBgaDA0GBoMjaHB0GBoMDSGBkODocHQYGgMDYYGQ4OhwdAYGgwNhgZDg6ExNBgaDA2GBkNjaDA0GBoMDYbG0GBoMDQYGgyNocHQYGgwNIYWAUODocHQYGgMDYYGQ4OhwdAYGgwNhgZDg6ExNBgaDA2GBkNjaDA0GBoMDYbG0GBoMDQYGgyNocHQYGgwNBgaQ4OhwdBgaAwNhgZDg6HB0BgaDA2GBkODoTE0GBoMDYYGQ2NoMDQYGgwNhsbQYGgwNBgaDI2hwdBgaLhbOoaiIPgUQ5oAAAAASUVORK5CYII="
+  />
+  <link rel="mask-icon" href="/favicon.svg" color="#154baa" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#154baa" />
   <title>Trans-Time — Построение маршрута</title>
 
   <!-- Стили интерфейса -->
@@ -47,6 +64,14 @@
         </button>
         <button id="clearVia" class="tt-btn" disabled>
           Сбросить via-точки
+        </button>
+        <button
+          id="toggle-drag"
+          class="tt-btn tt-btn-icon"
+          title="Правка маршрута заблокирована"
+          aria-pressed="false"
+        >
+          🔒
         </button>
       </div>
 

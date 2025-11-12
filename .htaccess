@@ -1,0 +1,18 @@
+# Исправляет ошибку 404 для favicon.ico и добавляет расширенную поддержку наборов favicon
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  # /favicon.ico недоступен как бинарный файл; проксируем на SVG, сохраняя 200.
+  RewriteRule ^favicon\.ico$ favicon.svg [L]
+</IfModule>
+
+<IfModule mod_mime.c>
+  AddType image/vnd.microsoft.icon .ico
+  AddType image/svg+xml .svg
+  AddType image/png .png
+</IfModule>
+
+<IfModule mod_headers.c>
+  <FilesMatch "\.(ico|svg|png)$">
+    Header set Cache-Control "public, max-age=86400, immutable"
+  </FilesMatch>
+</IfModule>

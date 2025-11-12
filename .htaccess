@@ -1,8 +1,8 @@
 # Исправляет ошибку 404 для favicon.ico и добавляет расширенную поддержку наборов favicon
 <IfModule mod_rewrite.c>
   RewriteEngine On
-  # Проксирует /favicon.ico на PHP-скрипт с встроенным ICO (без бинарных файлов в репозитории)
-  RewriteRule ^favicon\.ico$ favicon.ico.php [L]
+  # /favicon.ico недоступен как бинарный файл; проксируем на SVG, сохраняя 200.
+  RewriteRule ^favicon\.ico$ favicon.svg [L]
 </IfModule>
 
 <IfModule mod_mime.c>

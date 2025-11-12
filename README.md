@@ -8,10 +8,10 @@
 - **Производительность:** корректные MIME-типы и заголовки `Cache-Control: public, max-age=86400, immutable` позволяют браузеру повторно использовать ассеты без лишних запросов.
 
 ## Что реализовано
-- Базовые ссылки в `<head>`: `favicon.ico` (отдаётся PHP-скриптом без бинарника), адаптивный `favicon.svg` с поддержкой `prefers-color-scheme`, `apple-touch-icon` через data URI, `mask-icon`, `manifest.json`, `theme-color`.
+- Базовые ссылки в `<head>`: `favicon.ico` (логическое имя, проксируется на SVG), адаптивный `favicon.svg` с поддержкой `prefers-color-scheme`, `apple-touch-icon` через data URI, `mask-icon`, `manifest.json`, `theme-color`.
 - Клиентский монитор `monitorFaviconHealth()` в `assets/js/yandex.js` отслеживает успешную загрузку через `PerformanceObserver` и предупреждает, если ответа нет.
 - Встроенный SVG-fallback: при проблемах с сетевым запросом или отсутствующих ссылках скрипт переключает `<link id="tt-favicon">` на `data:`-иконку без 404.
-- Серверная конфигурация `.htaccess` направляет `/favicon.ico` в `favicon.ico.php`, который возвращает готовый ICO c корректными заголовками и кешированием без необходимости хранить бинарный файл.
+- Серверная конфигурация `.htaccess` задаёт корректный `Content-Type`, длительный кеш для иконок и переписывает запрос к `/favicon.ico` на `/favicon.svg`, если бинарные ассеты недоступны.
 
 ## Чек-лист тестирования
 1. Очистить кэш, открыть страницу и убедиться, что `/favicon.ico` и `/favicon.svg` отвечают `200` (либо берутся из кеша) без новых 404 в консоли; убедиться, что `apple-touch-icon` data URI присутствует в `<head>`.

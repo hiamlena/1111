@@ -8,6 +8,17 @@ let map, multiRoute, viaPoints = [];
 let viaMarkers = [];
 let activeRouteChangeHandler = null;
 let framesToggleStateBeforeCar = null;
+let startPoint = null;
+let endPoint = null;
+let lastBuildOptions = null;
+let editMode = false;
+let toggleDragControl = null;
+let updateUI = () => {};
+let waypointHandlerCleanup = [];
+let pathEventSubscriptions = [];
+let routePathDragCandidate = null;
+
+const ROUTE_DRAG_PIXEL_THRESHOLD = 6;
 
 /* ---------- Хелперы для работы с geoObjects ---------- */
 function addToMap(obj) {
@@ -92,6 +103,413 @@ function getCurrentVehMode() {
 
 function isCarMode() {
   return getCurrentVehMode() === 'car';
+}
+
+/* ---------- Маршрутное состояние и правка ---------- */
+function copyCoords(pair) {
+  const norm = normalizeCoordPair(pair);
+  if (!norm) return null;
+  return [norm[0], norm[1]];
+}
+
+function getReferencePointsArray() {
+  const pts = [];
+  const start = copyCoords(startPoint);
+  const finish = copyCoords(endPoint);
+  if (start) pts.push(start);
+  viaPoints.forEach(pt => {
+    const cp = copyCoords(pt);
+    if (cp) pts.push(cp);
+  });
+  if (finish) pts.push(finish);
+  return pts;
+}
+
+function computeRoutingOptions() {
+  const checked = document.querySelector('input[name=veh]:checked');
+  const mode = (checked && checked.value) || 'truck40';
+  const opts = { mode: 'truck' };
+  if (mode === 'car') opts.mode = 'auto';
+  if (mode === 'truck40') opts.weight = 40000;
+  if (mode === 'truckHeavy') opts.weight = 55000;
+  return opts;
+}
+
+function refreshEditToggleState() {
+  if (!toggleDragControl) return;
+  toggleDragControl.classList.toggle('is-active', !!editMode);
+  toggleDragControl.setAttribute('aria-pressed', editMode ? 'true' : 'false');
+  toggleDragControl.textContent = editMode ? '🔓' : '🔒';
+  toggleDragControl.title = editMode
+    ? 'Правка маршрута разблокирована'
+    : 'Правка маршрута заблокирована';
+}
+
+function clearWaypointHandlers() {
+  waypointHandlerCleanup.forEach(fn => {
+    try { fn(); } catch {}
+  });
+  waypointHandlerCleanup = [];
+}
+
+function syncWaypointDraggability() {
+  clearWaypointHandlers();
+  if (!multiRoute) return;
+  const enable = !!editMode;
+  try {
+    multiRoute.options?.set?.('wayPointDraggable', enable);
+    multiRoute.options?.set?.('viaPointDraggable', enable);
+  } catch {}
+
+  const collections = [];
+  const wps = multiRoute.getWayPoints?.();
+  const vias = multiRoute.getViaPoints?.();
+  if (wps) collections.push(wps);
+  if (vias) collections.push(vias);
+
+  collections.forEach(col => {
+    col.each(point => {
+      try { point.options?.set?.('draggable', enable); } catch {}
+      if (!point?.events || !enable) return;
+      const handler = () => {
+        captureReferencePointsFromMultiRoute();
+        refreshFramesForActiveRoute(getReferencePointsArray());
+        setupRoutePolylineEditing();
+        updateUI();
+      };
+      point.events.add('dragend', handler);
+      waypointHandlerCleanup.push(() => {
+        try { point.events.remove('dragend', handler); } catch {}
+      });
+    });
+  });
+}
+
+function clearRoutePathSubscriptions() {
+  pathEventSubscriptions.forEach(sub => {
+    const { path, handlers } = sub;
+    handlers.forEach(({ type, fn }) => {
+      try { path.events.remove(type, fn); } catch {}
+    });
+  });
+  pathEventSubscriptions = [];
+}
+
+function projectToPixels(coords) {
+  const projection = map?.options?.get?.('projection') || ymaps.projection.wgs84Mercator;
+  const zoom = map?.getZoom?.() ?? 10;
+  try {
+    return projection.toGlobalPixels(coords, zoom);
+  } catch {
+    return null;
+  }
+}
+
+function pixelsToCoords(px) {
+  const projection = map?.options?.get?.('projection') || ymaps.projection.wgs84Mercator;
+  const zoom = map?.getZoom?.() ?? 10;
+  try {
+    return projection.fromGlobalPixels(px, zoom);
+  } catch {
+    return null;
+  }
+}
+
+function distance2d(a, b) {
+  if (!a || !b) return Infinity;
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function closestPointOnSegment(a, b, p) {
+  if (!a || !b || !p) return a;
+  const abx = b[0] - a[0];
+  const aby = b[1] - a[1];
+  const apx = p[0] - a[0];
+  const apy = p[1] - a[1];
+  const abLenSq = abx * abx + aby * aby;
+  if (abLenSq === 0) return a;
+  let t = (apx * abx + apy * aby) / abLenSq;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  return [a[0] + abx * t, a[1] + aby * t];
+}
+
+function findClosestPointOnRoute(targetCoords) {
+  const activeRoute = multiRoute?.getActiveRoute?.();
+  const paths = activeRoute?.getPaths?.();
+  if (!paths) return null;
+  const targetPx = projectToPixels(targetCoords);
+  if (!targetPx) return null;
+  let best = null;
+  paths.each((path, pathIndex) => {
+    const coords = [];
+    path.getSegments?.().each(segment => {
+      const segCoords = segment.getCoordinates?.();
+      if (Array.isArray(segCoords)) {
+        segCoords.forEach(c => coords.push(c));
+      }
+    });
+    for (let i = 1; i < coords.length; i++) {
+      const aPx = projectToPixels(coords[i - 1]);
+      const bPx = projectToPixels(coords[i]);
+      if (!aPx || !bPx) continue;
+      const candidatePx = closestPointOnSegment(aPx, bPx, targetPx);
+      const dist = distance2d(candidatePx, targetPx);
+      if (!best || dist < best.dist) {
+        const geo = pixelsToCoords(candidatePx);
+        if (geo) best = { dist, coord: geo, pathIndex };
+      }
+    }
+  });
+  return best;
+}
+
+function captureReferencePointsFromMultiRoute() {
+  if (!multiRoute) return;
+  try {
+    const wps = multiRoute.getWayPoints?.();
+    if (wps?.getLength) {
+      let idx = 0;
+      let first = null;
+      let last = null;
+      wps.each(wp => {
+        const coords = copyCoords(wp.geometry?.getCoordinates?.());
+        if (coords) {
+          if (idx === 0) first = coords;
+          last = coords;
+        }
+        idx += 1;
+      });
+      if (first) startPoint = first;
+      if (last) endPoint = last;
+    }
+    const newVia = [];
+    const viaCollection = multiRoute.getViaPoints?.();
+    viaCollection?.each(vp => {
+      const coords = copyCoords(vp.geometry?.getCoordinates?.());
+      if (coords) newVia.push(coords);
+    });
+    viaPoints = newVia;
+    syncViaMarkers();
+    updateUI();
+  } catch {}
+}
+
+function detachViaMarkerHandlers(marker) {
+  if (!marker) return;
+  if (marker.__tt_dragHandler && marker.events?.remove) {
+    try { marker.events.remove('dragend', marker.__tt_dragHandler); } catch {}
+  }
+  delete marker.__tt_dragHandler;
+}
+
+function attachViaMarkerHandlers(marker) {
+  if (!marker) return;
+  detachViaMarkerHandlers(marker);
+  const handler = () => {
+    const idx = viaMarkers.indexOf(marker);
+    if (idx === -1) return;
+    if (!editMode) {
+      const original = viaPoints[idx];
+      if (original && marker.geometry?.setCoordinates) marker.geometry.setCoordinates(original);
+      return;
+    }
+    const prev = copyCoords(viaPoints[idx]);
+    const next = copyCoords(marker.geometry?.getCoordinates?.());
+    if (!next) return;
+    viaPoints[idx] = next;
+    buildRouteWithCoords(null, { silent: true }).catch(err => {
+      if (prev) {
+        viaPoints[idx] = prev;
+        try { marker.geometry?.setCoordinates?.(prev); } catch {}
+      }
+      toast(typeof err === 'string' ? err : (err?.message || 'Ошибка перестроения маршрута'));
+    }).finally(() => updateUI());
+  };
+  marker.events?.add('dragend', handler);
+  marker.__tt_dragHandler = handler;
+}
+
+function syncViaMarkers() {
+  for (let i = viaMarkers.length - 1; i >= viaPoints.length; i--) {
+    const marker = viaMarkers[i];
+    detachViaMarkerHandlers(marker);
+    removeFromMap(marker);
+    viaMarkers.pop();
+  }
+
+  viaPoints.forEach((coords, idx) => {
+    let marker = viaMarkers[idx];
+    if (!marker) {
+      marker = new ymaps.Placemark(
+        coords,
+        { hintContent: 'via ' + (idx + 1) },
+        { preset: 'islands#darkGreenCircleDotIcon', draggable: editMode }
+      );
+      viaMarkers[idx] = marker;
+      addToMap(marker);
+    } else {
+      try { marker.geometry?.setCoordinates?.(coords); } catch {}
+      marker.properties?.set?.('hintContent', 'via ' + (idx + 1));
+      marker.options?.set?.('draggable', editMode);
+    }
+    attachViaMarkerHandlers(marker);
+  });
+}
+
+function clearViaPoints() {
+  const prev = viaPoints.map(copyCoords).filter(Boolean);
+  viaPoints = [];
+  syncViaMarkers();
+  updateUI();
+  if (!multiRoute) return Promise.resolve();
+  return buildRouteWithCoords(null, { silent: true }).catch(err => {
+    viaPoints = prev;
+    syncViaMarkers();
+    updateUI();
+    throw err;
+  });
+}
+
+function insertViaPoint(coords, index = viaPoints.length, { toastMessage = null } = {}) {
+  const point = copyCoords(coords);
+  if (!point) return Promise.resolve();
+  const insertAt = Math.max(0, Math.min(index, viaPoints.length));
+  viaPoints.splice(insertAt, 0, point);
+  syncViaMarkers();
+  updateUI();
+  if (toastMessage) {
+    const message = typeof toastMessage === 'function' ? toastMessage(viaPoints.length, insertAt) : toastMessage;
+    toast(message, 1400);
+  }
+  if (!multiRoute) return Promise.resolve();
+  return buildRouteWithCoords(null, { silent: true }).catch(err => {
+    viaPoints.splice(insertAt, 1);
+    syncViaMarkers();
+    updateUI();
+    throw err;
+  });
+}
+
+function setEditMode(on) {
+  editMode = !!on;
+  refreshEditToggleState();
+  syncViaMarkers();
+  syncWaypointDraggability();
+  setupRoutePolylineEditing();
+}
+
+function setupRoutePolylineEditing() {
+  clearRoutePathSubscriptions();
+  routePathDragCandidate = null;
+  if (!editMode || !multiRoute) return;
+  const activeRoute = multiRoute.getActiveRoute?.();
+  const paths = activeRoute?.getPaths?.();
+  if (!paths) return;
+  paths.each((path, pathIndex) => {
+    if (!path?.events) return;
+    const down = (e) => {
+      if (!editMode) return;
+      const coords = e.get('coords');
+      if (!coords) return;
+      routePathDragCandidate = {
+        pathIndex,
+        downPixels: projectToPixels(coords)
+      };
+    };
+    const up = (e) => {
+      if (!editMode) return;
+      const coords = e.get('coords');
+      if (!coords || !routePathDragCandidate || routePathDragCandidate.pathIndex !== pathIndex) {
+        routePathDragCandidate = null;
+        return;
+      }
+      const upPixels = projectToPixels(coords);
+      const downPixels = routePathDragCandidate.downPixels;
+      routePathDragCandidate = null;
+      if (downPixels && upPixels && distance2d(downPixels, upPixels) < ROUTE_DRAG_PIXEL_THRESHOLD) return;
+      const snap = findClosestPointOnRoute(coords);
+      if (!snap) return;
+      const insertAt = Math.min(snap.pathIndex, viaPoints.length);
+      insertViaPoint(snap.coord, insertAt, { toastMessage: 'Via-точка добавлена на маршрут' }).catch(err => {
+        toast(typeof err === 'string' ? err : (err?.message || 'Ошибка перестроения маршрута'));
+      });
+    };
+    const leave = () => { routePathDragCandidate = null; };
+    path.events.add('mousedown', down);
+    path.events.add('mouseup', up);
+    path.events.add('mouseleave', leave);
+    pathEventSubscriptions.push({
+      path,
+      handlers: [
+        { type: 'mousedown', fn: down },
+        { type: 'mouseup', fn: up },
+        { type: 'mouseleave', fn: leave }
+      ]
+    });
+  });
+}
+
+async function buildRouteWithCoords(opts, { silent = true, toastMessage = null } = {}) {
+  const start = copyCoords(startPoint);
+  const finish = copyCoords(endPoint);
+  if (!start || !finish) throw new Error('Маршрут не задан');
+  const options = opts ? { ...opts } : (lastBuildOptions ? { ...lastBuildOptions } : computeRoutingOptions());
+  lastBuildOptions = { ...options };
+  const referencePoints = [start];
+  viaPoints.forEach(pt => {
+    const c = copyCoords(pt);
+    if (c) referencePoints.push(c);
+  });
+  referencePoints.push(finish);
+
+  const res = await YandexRouter.build(referencePoints, options);
+  applyRouteResult(res, referencePoints);
+  if (!silent) {
+    toast(toastMessage || 'Маршрут обновлён', 1600);
+  }
+}
+
+function applyRouteResult(res, referencePoints) {
+  const prevMultiRoute = multiRoute;
+  if (prevMultiRoute) {
+    if (activeRouteChangeHandler && prevMultiRoute.events?.remove) {
+      try { prevMultiRoute.events.remove('activeroutechange', activeRouteChangeHandler); } catch {}
+    }
+    removeFromMap(prevMultiRoute);
+  }
+  clearWaypointHandlers();
+  clearRoutePathSubscriptions();
+
+  multiRoute = res.multiRoute;
+  addToMap(multiRoute);
+
+  if (activeRouteChangeHandler && multiRoute?.events?.remove) {
+    try { multiRoute.events.remove('activeroutechange', activeRouteChangeHandler); } catch {}
+  }
+
+  renderRouteList(res.routes);
+  highlightActiveRouteItem();
+  refreshFramesForActiveRoute(referencePoints);
+  captureReferencePointsFromMultiRoute();
+  syncWaypointDraggability();
+  setupRoutePolylineEditing();
+  refreshEditToggleState();
+  updateUI();
+
+  if (multiRoute?.events?.add) {
+    activeRouteChangeHandler = () => {
+      captureReferencePointsFromMultiRoute();
+      highlightActiveRouteItem();
+      refreshFramesForActiveRoute(getReferencePointsArray());
+      setupRoutePolylineEditing();
+    };
+    multiRoute.events.add('activeroutechange', activeRouteChangeHandler);
+  } else {
+    activeRouteChangeHandler = null;
+  }
 }
 
 const LAYERS_BASE = window.TRANSTIME_CONFIG?.layersBase || (location.pathname.replace(/\/[^/]*$/, '') + '/data');
@@ -180,22 +598,9 @@ async function loadSavedRoute(index) {
     });
   }
 
-  viaPoints = [];
-  viaMarkers.forEach(removeFromMap);
-  viaMarkers = [];
-
-  (r.viaPoints || []).forEach(coords => {
-    viaPoints.push(coords);
-    if (map) {
-      const mark = new ymaps.Placemark(
-        coords,
-        { hintContent: 'via' },
-        { preset: 'islands#darkGreenCircleDotIcon' }
-      );
-      addToMap(mark);
-      viaMarkers.push(mark);
-    }
-  });
+  viaPoints = (r.viaPoints || []).map(copyCoords).filter(Boolean);
+  syncViaMarkers();
+  updateUI();
 
   fromEl?.dispatchEvent(new Event('input'));
   toEl?.dispatchEvent(new Event('input'));
@@ -218,7 +623,7 @@ function saveCurrentRoute() {
   const vehChecked = document.querySelector('input[name=veh]:checked');
   const veh = (vehChecked && vehChecked.value) || 'truck40';
 
-  savedRoutes.push({ from: fromVal, to: toVal, viaPoints: viaPoints.slice(), veh });
+  savedRoutes.push({ from: fromVal, to: toVal, viaPoints: viaPoints.map(copyCoords), veh });
   writeSavedRoutes();
   renderSavedRoutes();
   toast('Маршрут сохранён', 1600);
@@ -244,7 +649,7 @@ async function shareCurrentRoute() {
   const vehChecked = document.querySelector('input[name=veh]:checked');
   const veh = (vehChecked && vehChecked.value) || 'truck40';
 
-  const link = encodeSharePayload({ from: fromVal, to: toVal, viaPoints: viaPoints.slice(), veh });
+  const link = encodeSharePayload({ from: fromVal, to: toVal, viaPoints: viaPoints.map(copyCoords), veh });
   if (!link) return toast('Не удалось создать ссылку', 2000);
 
   if (navigator.clipboard?.writeText) {
@@ -576,6 +981,9 @@ function setup() {
   const saveRouteBtn   = $('#saveRouteBtn');
   const shareRouteBtn  = $('#shareRouteBtn');
   const openNavBtn     = $('#openNavBtn');
+  toggleDragControl = $('#toggle-drag');
+  toggleDragControl?.addEventListener('click', () => setEditMode(!editMode));
+  refreshEditToggleState();
 
   loadSavedRoutes();
   renderSavedRoutes();
@@ -589,7 +997,7 @@ function setup() {
   const cHgvC   = $('#toggle-hgv-conditional');
   const cFed    = $('#toggle-federal');
 
-  function updateUI() {
+  function updateUIInner() {
     const hasFrom = !!from?.value.trim();
     const hasTo   = !!to?.value.trim();
 
@@ -603,6 +1011,7 @@ function setup() {
       clearVia.title = clearVia.disabled ? 'Нет промежуточных точек для сброса' : '';
     }
   }
+  updateUI = updateUIInner;
   function updateVehGroup() {
     vehRadios.forEach(r => r.parentElement.classList.toggle('active', r.checked));
   }
@@ -626,25 +1035,20 @@ function setup() {
 
   map.events.add('click', (e) => {
     const coords = e.get('coords');
-    viaPoints.push(coords);
-    const mark = new ymaps.Placemark(
-      coords,
-      { hintContent: 'via ' + viaPoints.length },
-      { preset: 'islands#darkGreenCircleDotIcon' }
-    );
-    addToMap(mark);
-    viaMarkers.push(mark);
-    toast(`Добавлена via-точка (${viaPoints.length})`, 1200);
-    updateUI();
+    if (!coords) return;
+    if (multiRoute && !editMode) return;
+    insertViaPoint(coords, viaPoints.length, {
+      toastMessage: count => `Добавлена via-точка (${count})`
+    }).catch(err => {
+      toast(typeof err === 'string' ? err : (err?.message || 'Ошибка перестроения маршрута'));
+    });
   });
 
   buildBtn?.addEventListener('click', onBuild);
   clearVia?.addEventListener('click', () => {
-    viaPoints = [];
-    viaMarkers.forEach(removeFromMap);
-    viaMarkers = [];
-    toast('Via-точки очищены', 1200);
-    updateUI();
+    clearViaPoints()
+      .then(() => toast('Via-точки очищены', 1200))
+      .catch(err => toast(typeof err === 'string' ? err : (err?.message || 'Ошибка перестроения маршрута')));
   });
 
   updateUI();
@@ -655,55 +1059,22 @@ function setup() {
 /** Построение маршрута */
 async function onBuild() {
   try {
-    const checked = document.querySelector('input[name=veh]:checked');
-    const mode = (checked && checked.value) || 'truck40';
-    const opts = { mode: 'truck' };
-    if (mode === 'car') opts.mode = 'auto';
-    if (mode === 'truck40') opts.weight = 40000;
-    if (mode === 'truckHeavy') opts.weight = 55000;
-
     const fromVal = $('#from')?.value.trim();
     const toVal   = $('#to')?.value.trim();
     if (!fromVal || !toVal) throw new Error('Укажите адреса Откуда и Куда');
 
+    const opts = computeRoutingOptions();
     const A = await YandexRouter.geocode(fromVal);
     const B = await YandexRouter.geocode(toVal);
-    const points = [A, ...viaPoints, B];
 
-    const res = await YandexRouter.build(points, opts);
-    const mr = res.multiRoute;
-    const routes = res.routes;
+    const start = copyCoords(A);
+    const finish = copyCoords(B);
+    if (!start || !finish) throw new Error('Не удалось определить координаты точек');
 
-    const prevMultiRoute = multiRoute;
-    if (prevMultiRoute) {
-      if (activeRouteChangeHandler && prevMultiRoute.events?.remove) {
-        try { prevMultiRoute.events.remove('activeroutechange', activeRouteChangeHandler); } catch {}
-      }
-      removeFromMap(prevMultiRoute);
-    }
-    multiRoute = mr;
-    addToMap(multiRoute);
+    startPoint = start;
+    endPoint = finish;
 
-    if (activeRouteChangeHandler && multiRoute?.events?.remove) {
-      try { multiRoute.events.remove('activeroutechange', activeRouteChangeHandler); } catch {}
-    }
-
-    renderRouteList(routes);
-    highlightActiveRouteItem();
-    refreshFramesForActiveRoute(points);
-
-    // Отслеживаем смену активного маршрута: обновляем список и фильтр рамок
-    if (multiRoute?.events?.add) {
-      activeRouteChangeHandler = () => {
-        highlightActiveRouteItem();
-        refreshFramesForActiveRoute(points);
-      };
-      multiRoute.events.add('activeroutechange', activeRouteChangeHandler);
-    } else {
-      activeRouteChangeHandler = null;
-    }
-
-    toast('Маршрут успешно построен', 1800);
+    await buildRouteWithCoords(opts, { silent: false, toastMessage: 'Маршрут успешно построен' });
   } catch (e) {
     toast(typeof e === 'string' ? e : (e.message || 'Ошибка построения маршрута'));
   }

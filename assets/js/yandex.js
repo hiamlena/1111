@@ -1080,6 +1080,8 @@ async function onBuild() {
   }
 }
 
+monitorFaviconHealth();
+
 /** Авто-инициализация */
 if (typeof window !== 'undefined') {
   if (document.readyState === 'loading') {

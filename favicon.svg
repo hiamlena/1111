@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Trans-Time favicon</title>
+  <desc id="desc">Monogram TT in rounded square adapting to color scheme</desc>
+  <style>
+    :root { color-scheme: light dark; }
+    .bg { fill: #154baa; }
+    .text { fill: #fff; font: 32px 'Segoe UI', 'DejaVu Sans', sans-serif; font-weight: 700; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #5a8dff; }
+      .text { fill: #0b1e3d; }
+    }
+  </style>
+  <rect class="bg" x="8" y="8" width="48" height="48" rx="12" ry="12" />
+  <text class="text" x="32" y="40" text-anchor="middle">TT</text>
+</svg>
